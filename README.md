@@ -1,8 +1,79 @@
-# 三相机位姿生成
+# 三相机位姿生成流程
 
 使用 `extrinsics/rig_extrinsics.yaml` 中的刚体外参，将 `colmap/sparse` 中每一帧前相机位姿转换为左、中、右相机位姿。中相机记为 `mid`，与 YAML 一致。
 
-## 运行
+## 主程序
+
+推荐入口为项目根目录的 `main.py`，按以下顺序调用项目模块：
+
+1. 通过 `transformZ.align_model()`，根据距离文件恢复整个 sparse 模型的米制尺度，并以参考前相机的光学坐标系定义新世界坐标系。
+2. 从转换后的模型读取前相机位姿，调用 `generate_poses()` 计算左、中、右相机位姿，输出四相机的 JSON 和 CSV。
+
+需要 Python 3.10+、`requirements.txt` 中的依赖，以及运行环境中的 COLMAP 命令行程序。导入项目模块不会执行 COLMAP；只有调用主流程或独立对齐程序时才检查该程序是否可用。
+
+```powershell
+python -m pip install -r requirements.txt
+python main.py --input colmap/sparse --distance distance.xlsx --extrinsics extrinsics/rig_extrinsics.yaml --output outputs/pipeline
+```
+
+COLMAP 未加入 PATH 时，通过 `--colmap-bin "C:\path\to\colmap.exe"` 指定程序路径。可以通过 `--reference-image front_1785227493507.jpg` 指定参考帧；不指定时，选择按图像名自然排序的第一个已注册前相机。参考帧必须属于 `--front-name-pattern` 和 `--front-camera-id` 筛选后的前相机集合。
+
+参考帧相机中心变为 `(0, 0, 0)`，相机到世界、世界到相机变换均为单位矩阵；新世界轴为该帧光学 X 向右、Y 向下、Z 向前。这里的 Z 轴是参考相机光轴，不代表重力方向。世界坐标变换为 `X_new = s * (R_ref @ X_old + t_ref)`，同时作用于模型位姿和三维点。
+
+**尺度只恢复一次。** 第一步已经将模型变为米制，第二步固定使用 `meters_per_colmap_unit=1.0`，直接将以米为单位的机间外参与前相机位姿组合。原始尺度因子 `s` 单独保存在报告中，不会再次应用于三相机基线。
+
+默认输出结构：
+
+```text
+outputs/pipeline/
+  sparse_metric/             # 已恢复尺度并对齐的完整 COLMAP 模型
+    transform_sim3.txt       # COLMAP 使用的八项 Sim3 参数
+    T_new_from_old.txt        # 新旧世界坐标之间的 4x4 相似变换矩阵
+    scale_report.json        # 尺度拟合及模型变换验证报告
+  poses/
+    poses.json               # 四相机位姿，含参考坐标系、单位、标定与对齐元数据
+    poses.csv                # 每帧 front/left/mid/right 各一行，length_unit=m
+  pipeline_report.json       # 完整流程的输入、输出、参考帧、尺度和统计信息
+```
+
+重复运行时，显式传入 `--overwrite` 才会替换已有主流程结果。输入 sparse 模型、距离文件和外参文件必须放在输出目录之外。完整模型在临时目录完成转换和验证后才发布到 `sparse_metric`。
+
+尺度拟合延用原程序的累计相机路径弦长最小二乘方法；输入位姿的离群点、采样稀疏和距离数据误差都会影响拟合。流程保留原始帧，不自动删除、插值或平滑位姿，可检查 `scale_report.json` 中的误差统计。
+
+COLMAP 的相似变换文件采用 `scale qw qx qy qz tx ty tz` 八项格式，见 [COLMAP Sim3 文件实现](https://github.com/colmap/colmap/blob/main/src/colmap/geometry/sim3.cc)。
+
+## 代码结构
+
+```text
+main.py                  # 参数解析与主程序入口
+src/
+  pipeline.py            # 配置、返回结果与两阶段流程编排
+  transformZ.py          # 尺度估计、参考相机对齐、COLMAP 调用与结果验证
+  distance_io.py         # TXT 距离读取及 Excel 到 TXT 的转换
+  colmap_io.py           # COLMAP BIN/TXT 位姿读取、前相机筛选和排序
+  geometry.py            # 四元数、旋转矩阵、相机中心及位姿求逆
+  generate_poses.py      # 机间外参读取、位姿计算与 JSON/CSV 导出
+  visualize_poses.py     # 轨迹图与统计导出
+```
+
+Python 调用接口：
+
+```python
+from pathlib import Path
+from src.pipeline import PipelineConfig, run_pipeline
+
+result = run_pipeline(PipelineConfig(
+    input_model=Path("colmap/sparse"),
+    distance_file=Path("distance.xlsx"),
+    extrinsics_file=Path("extrinsics/rig_extrinsics.yaml"),
+    output_dir=Path("outputs/pipeline"),
+    reference_image="front_1785227493507.jpg",
+    colmap_bin="colmap",
+))
+print(result.poses_csv)
+```
+
+## 独立运行位姿生成
 
 需要 Python 3.10 或以上版本：
 
@@ -23,7 +94,7 @@ python src/generate_poses.py --model colmap/sparse --extrinsics extrinsics/rig_e
 
 ## 尺度与精度
 
-**当前 COLMAP 重建尚未定标。已知以米为单位的相机间外参，不能单独确定单目重建的绝对尺度。** 默认运行会暂时假设 `1 COLMAP 单位 = 1 米`，在终端警告，并在 JSON 和 CSV 中记录 `scale_status = assumed`。这些位置只能用作暂定结果；旋转不受该尺度参数影响。
+直接对未定标模型独立运行 `generate_poses.py` 时，已知以米为单位的相机间外参不能单独确定绝对尺度。省略尺度参数会暂时假设 `1 COLMAP 单位 = 1 米`，在终端警告，并记录 `scale_status = assumed`。这些位置仅为暂定结果；旋转不受尺度参数影响。主程序 `main.py` 先完成定标，不会使用这个暂定模式。
 
 得到尺度后，重新运行。例如，测量场景中两点的真实距离为 `2 m`，在 COLMAP 重建中距离为 `5`，则 `s = 2 / 5 = 0.4 m/COLMAP 单位`：
 
@@ -32,6 +103,8 @@ python src/generate_poses.py --meters-per-colmap-unit 0.4
 ```
 
 输出始终保留原 COLMAP 世界坐标系和单位，标定平移除以 `s` 后再参与计算，因此能够与原始点云对齐。若还需要米制世界坐标，将输出的平移、相机中心及对应点云坐标统一乘以 `s`。`scale_status = provided` 表示尺度由调用者提供，并不表示代码验证了定标准确性。
+
+上述说明适用于直接输入未定标模型的独立模式。对已经米制对齐的模型，可运行 `python src/generate_poses.py --model outputs/pipeline/sparse_metric --metric-model`，此时输出单位为米，并且不再次缩放模型。
 
 此外，当前 YAML 声明了 `extrinsics_approximate: 1`：前相机工作姿态由绕光心俯仰的假设得到，旋转轴和光心位移未经测量。结果会保留该精度说明。
 
@@ -93,6 +166,14 @@ python src/visualize_poses.py
 ```powershell
 python src/visualize_poses.py --csv outputs/poses.csv --output outputs --arrow-length 0.3 --dpi 200
 ```
+
+可视化主流程的米制结果：
+
+```powershell
+python src/visualize_poses.py --csv outputs/pipeline/poses/poses.csv --output outputs/pipeline/plots
+```
+
+可视化程序读取 `length_unit` 标注坐标和路程单位；米制结果使用 `m`，旧版无该列的 CSV 仍按 COLMAP 单位显示。
 
 尺度尚未定标时，图标题会明确标出位置为暂定值，不将坐标直接标为米。绘图与交互导出采用 [Matplotlib](https://matplotlib.org/stable/) 和 [Plotly 的自包含 HTML 导出](https://plotly.com/python/interactive-html-export/)。
 

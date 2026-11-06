@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +15,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 
-from generate_poses import PROJECT_ROOT, quaternion_to_rotation
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src import PROJECT_ROOT
+from src.colmap_io import natural_key
+from src.geometry import quaternion_to_rotation
 
 
 CAMERAS = ("front", "left", "mid", "right")
@@ -34,15 +38,15 @@ class TrajectoryData:
     meters_per_colmap_unit: float
     scale_status: str
     front_frame: str
+    length_unit: str = "colmap_unit"
 
     @property
     def frame_count(self):
         return len(self.image_names)
 
-
-def natural_key(name):
-    return tuple((0, int(part)) if part.isdigit() else (1, part)
-                 for part in re.split(r"(\d+)", name))
+    @property
+    def unit_label(self):
+        return "m" if self.length_unit == "m" else "COLMAP unit"
 
 
 def load_trajectories(path: Path) -> TrajectoryData:
@@ -78,7 +82,12 @@ def load_trajectories(path: Path) -> TrajectoryData:
                 scale = float(row["meters_per_colmap_unit"])
                 if not math.isfinite(scale) or scale <= 0:
                     raise ValueError("Scale must be finite and positive")
-                metadata.add((scale, row["scale_status"], row["front_frame"]))
+                unit = row.get("length_unit") or "colmap_unit"
+                if unit not in ("m", "colmap_unit"):
+                    raise ValueError(f"Unknown length unit: {unit}")
+                if unit == "m" and (scale != 1.0 or row["scale_status"] == "assumed"):
+                    raise ValueError("Metric coordinates must use an explicit 1 meter/unit")
+                metadata.add((scale, row["scale_status"], row["front_frame"], unit))
                 frame[camera] = (center, rotation.T[:, 2],
                                  int(row["source_image_id"]), int(row["source_camera_id"]))
             except (ValueError, TypeError) as error:
@@ -95,12 +104,12 @@ def load_trajectories(path: Path) -> TrajectoryData:
                              "For older three-camera CSV files, rerun src/generate_poses.py.")
         if len({pose[2:] for pose in frame.values()}) != 1:
             raise ValueError(f"Mismatched source frame IDs for {name}")
-    scale, status, front_frame = next(iter(metadata))
+    scale, status, front_frame, unit = next(iter(metadata))
     return TrajectoryData(
         names,
         {camera: np.array([grouped[name][camera][0] for name in names]) for camera in CAMERAS},
         {camera: np.array([grouped[name][camera][1] for name in names]) for camera in CAMERAS},
-        scale, status, front_frame,
+        scale, status, front_frame, unit,
     )
 
 
@@ -109,7 +118,7 @@ def trajectory_summary(data: TrajectoryData) -> list[dict]:
     for camera in CAMERAS:
         points = data.centers[camera]
         result.append({
-            "camera": camera, "frame_count": len(points), "length_unit": "colmap_unit",
+            "camera": camera, "frame_count": len(points), "length_unit": data.length_unit,
             "path_length": float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum()),
             "start_end_distance": float(np.linalg.norm(points[-1] - points[0])),
             **{f"start_{axis}": float(points[0, i]) for i, axis in enumerate("xyz")},
@@ -121,6 +130,9 @@ def trajectory_summary(data: TrajectoryData) -> list[dict]:
 
 
 def scale_caption(data: TrajectoryData, chinese=False) -> str:
+    if data.length_unit == "m":
+        return (f"世界坐标 · {data.frame_count} 帧 · 米制坐标"
+                if chinese else f"{data.frame_count} frames | World coordinates | Metric units (m)")
     if chinese:
         status = "未定标，位置为暂定值" if data.scale_status == "assumed" else "使用所提供尺度"
         return f"COLMAP 世界坐标 · {data.frame_count} 帧 · {status} · {data.meters_per_colmap_unit:g} m / COLMAP unit"
@@ -194,7 +206,7 @@ def interactive_figure(data: TrajectoryData, arrow_length: float) -> go.Figure:
         font=dict(family="Microsoft YaHei, Arial, sans-serif", size=14),
         scene=dict(aspectmode="data", dragmode="orbit", uirevision="keep-view",
                    camera=dict(eye=dict(x=1.6, y=1.5, z=0.9)),
-                   **{f"{axis}axis": dict(title=f"{axis.upper()} (COLMAP unit)",
+                   **{f"{axis}axis": dict(title=f"{axis.upper()} ({data.unit_label})",
                                            range=[float(low[i]), float(high[i])])
                       for i, axis in enumerate("xyz")}),
         legend=dict(orientation="h", x=0.02, y=1.01, groupclick="togglegroup"),
@@ -231,14 +243,14 @@ def save_static_figure(data: TrajectoryData, output: Path, arrow_length: float, 
             axis.scatter(points[0, a], points[0, b], color=color, marker="o", s=24, edgecolors="white")
             axis.scatter(points[-1, a], points[-1, b], color=color, marker="X", s=32, edgecolors="white")
     for axis, (a, b) in projections:
-        axis.set(xlabel=f"{'XYZ'[a]} (COLMAP unit)", ylabel=f"{'XYZ'[b]} (COLMAP unit)",
+        axis.set(xlabel=f"{'XYZ'[a]} ({data.unit_label})", ylabel=f"{'XYZ'[b]} ({data.unit_label})",
                  title=f"{'XYZ'[a]}{'XYZ'[b]} projection", xlim=(low[a], high[a]), ylim=(low[b], high[b]))
         # Expand each projection to its panel so small offsets remain readable.
         # The 3D view retains equal physical units; 2D scales are labeled explicitly.
         axis.set_aspect("auto")
         axis.grid(alpha=0.22)
         axis.tick_params(labelsize=9)
-    axis3d.set(xlabel="X (COLMAP unit)", ylabel="Y (COLMAP unit)", zlabel="Z (COLMAP unit)",
+    axis3d.set(xlabel=f"X ({data.unit_label})", ylabel=f"Y ({data.unit_label})", zlabel=f"Z ({data.unit_label})",
                xlim=(low[0], high[0]), ylim=(low[1], high[1]), zlim=(low[2], high[2]))
     axis3d.set_box_aspect(high - low)
     axis3d.view_init(elev=24, azim=-56)
@@ -275,7 +287,7 @@ def visualize_poses(csv_path: Path, output_dir: Path, *, arrow_length=None, dpi=
     print(scale_caption(data))
     for row in summary:
         print(f"{row['camera']:5s}: {row['frame_count']} poses, sampled path length "
-              f"{row['path_length']:.4f} COLMAP units")
+              f"{row['path_length']:.4f} {data.unit_label}")
     for path in (html, png, summary_csv):
         print(f"Saved: {path.resolve()}")
     return data
@@ -285,7 +297,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, default=PROJECT_ROOT / "outputs/poses.csv")
     parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "outputs")
-    parser.add_argument("--arrow-length", type=float, help="Optical-axis arrow length in COLMAP units")
+    parser.add_argument("--arrow-length", type=float, help="Optical-axis arrow length in the CSV coordinate unit")
     parser.add_argument("--dpi", type=int, default=180)
     args = parser.parse_args(argv)
     try:
