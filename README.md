@@ -96,6 +96,14 @@ python src/visualize_poses.py --csv outputs/poses.csv --output outputs --arrow-l
 
 尺度尚未定标时，图标题会明确标出位置为暂定值，不将坐标直接标为米。绘图与交互导出采用 [Matplotlib](https://matplotlib.org/stable/) 和 [Plotly 的自包含 HTML 导出](https://plotly.com/python/interactive-html-export/)。
 
+## transformZ 距离文件输入
+
+`src/transformZ.py` 的 `--distance` 参数接受 TXT 或 Excel（`.xlsx`、`.xls`、`.xlsm`、`.excel`）。Excel 默认读取第一个工作表，支持当前 `distance.xlsx` 的 `name / distance / time` 列：按列名提取 `name` 和 `distance`，忽略 `time`。也支持无表头的“距离、图像名”或“图像名、距离”两列数据。距离单位为米。
+
+Excel 会先转换为同目录的同名 TXT，例如 `distance.xlsx` → `distance.txt`，每行格式为 `距离 图像名`，然后继续原有尺度计算。转换时校验缺失值、非有限数、负距离和重复图像名；公式单元格使用 Excel 保存的计算结果，需先在 Excel 中计算并保存。若已有 TXT 内容不同，会另存为 `distance.converted.txt` 等名称；内容相同则直接复用。
+
+例如，在原有运行命令中改为 `--distance distance.xlsx` 即可，不需要手动转换。Excel 读取依赖 `openpyxl`（现代 Excel 格式）或 `xlrd`（旧版 XLS），已加入 `requirements.txt`。
+
 ## 验证
 
 ```powershell
