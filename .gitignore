@@ -4,6 +4,8 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+outputs/
+tests/
 extrinsics/*.yaml
 colmap/sparse
 
