@@ -6,6 +6,7 @@ venv/
 .pytest_cache/
 outputs/
 tests/
+json/
 extrinsics/*.yaml
 colmap/sparse
 
