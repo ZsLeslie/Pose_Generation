@@ -4,14 +4,8 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
-
-# 数据集和模型
-data/
-datasets/
-outputs/
-checkpoints/
-*.pth
-*.pt
+extrinsics/*.yaml
+colmap/sparse
 
 # 日志
 *.log
