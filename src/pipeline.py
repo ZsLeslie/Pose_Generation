@@ -29,6 +29,7 @@ class PipelineConfig:
     laser_extrinsics_file: Path | None = None
     laser_distance_step_m: float = 0.01
     laser_filter_pose_outliers: bool = True
+    sync_pose_outlier_filter: bool = False
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class PipelineResult:
     laser_ply: Path | None = None
     laser_poses: Path | None = None
     laser_report: Path | None = None
+    excluded_pose_names: tuple[str, ...] = ()
 
 
 def validate_pipeline_paths(input_model, distance_file, extrinsics_file, output_dir, overwrite,
@@ -81,6 +83,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
     scan_file = None if config.scan_file is None else Path(config.scan_file).resolve()
     laser_extrinsics = (None if config.laser_extrinsics_file is None
                         else Path(config.laser_extrinsics_file).resolve())
+    if config.sync_pose_outlier_filter and (scan_file is None or not config.laser_filter_pose_outliers):
+        raise ValueError("--sync-pose-outlier-filter requires laser stitching with pose-outlier detection; "
+                         "do not combine it with --skip-laser or --keep-laser-pose-outliers")
     validate_pipeline_paths(input_model, distance_file, extrinsics_file, output_dir, config.overwrite,
                             scan_file, laser_extrinsics)
     # Reject invalid calibration before starting an external model transformation.
@@ -119,6 +124,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         "scale_report": str(aligned.output_model / "scale_report.json"),
     }
     poses_dir = output_dir / "poses"
+    excluded_names = (laser_result.excluded_pose_names
+                      if config.sync_pose_outlier_filter and laser_result is not None else ())
     poses = generate_poses(
         aligned.output_model, extrinsics_file, poses_dir,
         # Stage 1 has ALREADY applied the original scale to the whole model.
@@ -127,6 +134,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         world_frame=f"reference front camera: {aligned.reference_image}",
         front_frame=config.front_frame, front_name_pattern=config.front_name_pattern,
         front_camera_id=config.front_camera_id, alignment=alignment_info,
+        exclude_image_names=excluded_names,
     )
     report_path = output_dir / "pipeline_report.json"
     report = {
@@ -138,6 +146,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         "original_meters_per_colmap_unit": aligned.meters_per_input_unit,
         "aligned_model_meters_per_unit": 1.0,
         "frame_count": poses["metadata"]["frame_count"],
+        "source_frame_count": poses["metadata"]["source_frame_count"],
+        "pose_outlier_filter": {
+            "sync_with_laser": config.sync_pose_outlier_filter,
+            "excluded_frame_count": poses["metadata"]["excluded_frame_count"],
+            "excluded_image_names": poses["metadata"]["excluded_image_names"],
+        },
         "generated_side_pose_count": poses["metadata"]["generated_pose_count"],
         "exported_four_camera_pose_count": poses["metadata"]["exported_pose_count"],
         "poses_json": str(poses_dir / "poses.json"), "poses_csv": str(poses_dir / "poses.csv"),
@@ -158,4 +172,5 @@ def run_pipeline(config: PipelineConfig) -> PipelineResult:
         laser_ply=None if laser_result is None else laser_result.ply_path,
         laser_poses=None if laser_result is None else laser_result.poses_path,
         laser_report=None if laser_result is None else laser_result.report_path,
+        excluded_pose_names=tuple(poses["metadata"]["excluded_image_names"]),
     )

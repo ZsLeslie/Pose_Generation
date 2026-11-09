@@ -45,7 +45,7 @@ outputs/pipeline/
 
 重复运行时，显式传入 `--overwrite` 才会替换已有主流程结果。输入 sparse 模型、距离文件、扫描文件和外参文件必须放在输出目录之外。完整模型在临时目录完成转换和验证后才发布到 `sparse_metric`。
 
-尺度拟合延用原程序的累计相机路径弦长最小二乘方法；输入位姿的离群点、采样稀疏和距离数据误差都会影响拟合。原始 sparse 与四相机导出保留全部选中帧；雷达阶段会单独检测并排除插值锚点中的离群位姿，不回写 sparse 模型或相机 CSV。可检查 `scale_report.json` 的拟合误差和 `laser_report.json` 的排除记录。
+尺度拟合延用原程序的累计相机路径弦长最小二乘方法；输入位姿的离群点、采样稀疏和距离数据误差都会影响拟合。原始 sparse 保留全部选中帧；雷达阶段单独检测并排除插值锚点中的离群位姿。四相机导出默认保留全部选中帧，可通过 `--sync-pose-outlier-filter` 同步剔除雷达检测到的异常相机帧。可检查 `scale_report.json` 的拟合误差和 `laser_report.json` 的排除记录。
 
 COLMAP 的相似变换文件采用 `scale qw qx qy qz tx ty tz` 八项格式，见 [COLMAP Sim3 文件实现](https://github.com/colmap/colmap/blob/main/src/colmap/geometry/sim3.cc)。
 
@@ -94,7 +94,19 @@ print(result.poses_csv)
 
 默认使用相邻前相机时间窗口前后各 20 秒的扫描记录，在两帧累计里程范围内，按 0.01 米网格选择最近的扫描。相机中心按选中扫描的实际里程线性插值，旋转使用 SLERP。重复里程保留最后一次记录，同一条扫描最多拼接一次，不将相同测量重复复制到多个网格位置；不对相机里程范围外的扫描做外推。`--laser-distance-step 0` 可处理每个窗口内所有唯一里程的扫描。
 
-位姿异常检测沿用原脚本的 0.15 米位置残差下限、2° 旋转残差下限、6 倍 MAD 系数及最多 5 轮局部峰值剔除。仅从雷达插值中排除这些帧，报告会保存图像名和残差。`--keep-laser-pose-outliers` 可关闭该检测。该步骤不能消除已受离群位姿影响的尺度拟合误差。
+位姿异常检测沿用原脚本的 0.15 米位置残差下限、2° 旋转残差下限、6 倍 MAD 系数及最多 5 轮局部峰值剔除。默认仅从雷达插值中排除这些帧，报告会保存图像名和残差。`--keep-laser-pose-outliers` 可关闭该检测。该步骤不能消除已受离群位姿影响的尺度拟合误差。
+
+开启相机位姿同步过滤：
+
+```powershell
+python main.py --sync-pose-outlier-filter --overwrite
+```
+
+该开关默认为关闭。开启时，左中右相机位姿生成复用雷达阶段检测出的异常图像名，不重复检测；`poses.json` 和 `poses.csv` 同步移除这些图像对应的整组 `front/left/mid/right` 位姿，保持四相机帧集合一致，并更新导出帧数和位姿数量。原始和米制 sparse 模型、世界坐标系及尺度保持不变。没有检测到异常时保留所有帧。
+
+这里只同步 `excluded_pose_outliers` 中的异常相机帧，不将 `unselected_scan_count` 对应的未选扫描当作异常位姿，也不额外同步因重复或回退里程跳过的相机记录。开启该参数时，需要执行雷达阶段并启用位姿异常检测，因此不能与 `--skip-laser` 或 `--keep-laser-pose-outliers` 同时使用。Python 接口对应 `PipelineConfig(sync_pose_outlier_filter=True)`。
+
+导出元数据记录 `source_frame_count`、`excluded_frame_count`、`excluded_image_names`；`pipeline_report.json` 中的 `pose_outlier_filter` 记录开关状态和实际剔除结果。通用 `generate_poses()` 接口也支持 `exclude_image_names` 参数，用于按源图像名排除整组相机位姿。
 
 雷达局部坐标沿用原脚本：`[r*sin(angle), 0, -r*cos(angle)]`。默认安装外参也沿用原脚本：雷达在前相机坐标中的偏移为 `[-36, 32.258, -442.5] mm`，局部点先绕 X 轴旋转 90° 再加偏移。需要对应当前 rig 时，可提供 OpenCV YAML：
 

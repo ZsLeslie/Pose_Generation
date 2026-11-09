@@ -12,6 +12,7 @@ import json
 import math
 import sys
 from pathlib import Path
+from typing import Collection
 
 import cv2
 import numpy as np
@@ -103,6 +104,22 @@ def compute_rig_poses(images: list[ImagePose], transforms: dict[str, np.ndarray]
     return frames
 
 
+def exclude_front_images(images: list[ImagePose], image_names: Collection[str] | None):
+    """Remove whole synchronized frames by exact source name, preserving order."""
+    if isinstance(image_names, str):
+        raise ValueError("Excluded image names must be a collection, not a single string")
+    requested = {name.replace("\\", "/") for name in (image_names or ())}
+    available = {image.name.replace("\\", "/") for image in images}
+    unknown = requested - available
+    if unknown:
+        raise ValueError("Excluded front images are not in the selected model: " + ", ".join(sorted(unknown)))
+    excluded = [image.name for image in images if image.name.replace("\\", "/") in requested]
+    retained = [image for image in images if image.name.replace("\\", "/") not in requested]
+    if not retained:
+        raise ValueError("No front poses remain after applying the image exclusions")
+    return retained, excluded
+
+
 def save_pose_files(result: dict, output: Path):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -131,7 +148,8 @@ def generate_poses(model: Path, extrinsics: Path, output: Path, *,
                    meters_per_colmap_unit: float | None = None,
                    front_frame: str = "work", front_name_pattern: str = "front_*",
                    front_camera_id: int | None = None, length_unit: str = "colmap_unit",
-                   world_frame: str = "unchanged COLMAP world frame", alignment: dict | None = None) -> dict:
+                   world_frame: str = "unchanged COLMAP world frame", alignment: dict | None = None,
+                   exclude_image_names: Collection[str] | None = None) -> dict:
     scale = 1.0 if meters_per_colmap_unit is None else meters_per_colmap_unit
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("meters_per_colmap_unit must be finite and positive")
@@ -142,6 +160,8 @@ def generate_poses(model: Path, extrinsics: Path, output: Path, *,
     model, extrinsics = Path(model), Path(extrinsics)
     transforms, calibration = load_extrinsics(extrinsics, front_frame)
     images, source = read_front_poses(model, front_name_pattern, front_camera_id)
+    source_frame_count = len(images)
+    images, excluded = exclude_front_images(images, exclude_image_names)
     warnings = []
     if meters_per_colmap_unit is None:
         warnings.append("COLMAP scale is unknown: provisionally assuming 1 unit = 1 m; positions are provisional.")
@@ -153,6 +173,8 @@ def generate_poses(model: Path, extrinsics: Path, output: Path, *,
         "source_images": str(source.resolve()), "extrinsics_file": str(extrinsics.resolve()),
         "front_frame": front_frame, "front_name_pattern": front_name_pattern,
         "front_camera_id_filter": front_camera_id, "frame_count": len(images),
+        "source_frame_count": source_frame_count, "excluded_frame_count": len(excluded),
+        "excluded_image_names": excluded,
         "generated_pose_count": len(images) * len(CAMERAS), "exported_pose_count": len(images) * len(CSV_CAMERAS),
         "world_frame": world_frame, "length_unit": length_unit, "meters_per_colmap_unit": scale,
         "scale_status": "assumed" if meters_per_colmap_unit is None else "provided",

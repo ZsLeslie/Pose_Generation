@@ -37,6 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Laser distance grid in meters; 0 uses all unique scan distances")
     parser.add_argument("--keep-laser-pose-outliers", action="store_true",
                         help="Disable pose-outlier exclusion for laser interpolation")
+    parser.add_argument("--sync-pose-outlier-filter", action="store_true",
+                        help="Also exclude laser-detected outlier frames from four-camera pose exports")
     parser.add_argument("--overwrite", action="store_true", help="Replace existing pipeline results")
     return parser
 
@@ -52,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         scan_file=None if args.skip_laser else args.scan, laser_extrinsics_file=args.laser_extrinsics,
         laser_distance_step_m=args.laser_distance_step,
         laser_filter_pose_outliers=not args.keep_laser_pose_outliers,
+        sync_pose_outlier_filter=args.sync_pose_outlier_filter,
     )
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     try:
@@ -62,6 +65,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Reference world frame: {result.reference_image}; output unit: meters")
     print(f"Aligned model: {result.aligned_model}")
     print(f"Four-camera poses: {result.poses_csv}")
+    if config.sync_pose_outlier_filter:
+        print(f"Camera frames excluded using laser pose-outlier detection: {len(result.excluded_pose_names)}")
     if result.laser_ply is not None:
         print(f"Stitched laser cloud: {result.laser_ply}")
         print(f"Laser report: {result.laser_report}")
