@@ -15,7 +15,7 @@ from .transformZ import AlignmentConfig, align_model
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    input_model: Path = PROJECT_ROOT / "colmap/sparse"
+    input_model: Path = PROJECT_ROOT / "colmap/sparse/0"
     distance_file: Path = PROJECT_ROOT / "distance.xlsx"
     extrinsics_file: Path = PROJECT_ROOT / "extrinsics/rig_extrinsics.yaml"
     output_dir: Path = PROJECT_ROOT / "outputs/pipeline"

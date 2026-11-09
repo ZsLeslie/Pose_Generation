@@ -7,13 +7,14 @@ X_new = s * (R_ref @ X_old + t_ref), with output coordinates in meters.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
 import numpy as np
@@ -21,7 +22,7 @@ import numpy as np
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.colmap_io import ImagePose, make_image_pose, read_front_poses, read_images_text
+from src.colmap_io import ImagePose, read_front_poses, read_images_text
 from src.distance_io import (
     convert_distance_excel_to_txt,
     iter_excel_distance_rows,
@@ -33,6 +34,7 @@ from src.geometry import (
     quaternion_to_rotation as qvec_to_rotmat,
     rotation_to_quaternion,
 )
+from src.scale_estimation import ScaleFitOptions, estimate_metric_scale
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,7 @@ class AlignmentConfig:
     front_name_pattern: str = "front_*"
     front_camera_id: int | None = None
     overwrite: bool = False
+    scale_fit_options: ScaleFitOptions = ScaleFitOptions()
 
 
 @dataclass(frozen=True)
@@ -80,62 +83,6 @@ def find_reference(images: list[ImagePose], requested_name: str | None) -> Image
     if len(matches) != 1:
         raise ValueError(f"Reference front image is missing or ambiguous: {requested_name}")
     return matches[0]
-
-
-def estimate_metric_scale(images, distances: dict[str, float]) -> tuple[float, dict]:
-    """Fit cumulative camera-path chords to cumulative meter readings.
-
-    Every selected front image needs a distance. Unregistered distance rows are
-    ignored. This preserves the previous transformZ least-squares scale fit.
-    """
-    if isinstance(images, dict):
-        images = [make_image_pose(pose["image_id"], pose["camera_id"], name,
-                                  pose["qvec"], pose["tvec"])
-                  for name, pose in images.items()]
-    by_basename = {}
-    for name, distance in distances.items():
-        by_basename.setdefault(name.rsplit("/", 1)[-1], []).append((name, distance))
-    matched, used = [], set()
-    for image in images:
-        normalized = image.name.replace("\\", "/")
-        if normalized in distances:
-            distance_name, distance = normalized, distances[normalized]
-        else:
-            candidates = by_basename.get(normalized.rsplit("/", 1)[-1], [])
-            if len(candidates) != 1:
-                raise ValueError(f"Missing or ambiguous distance for image: {image.name}")
-            distance_name, distance = candidates[0]
-        if distance_name in used:
-            raise ValueError(f"Distance record matches multiple cameras: {distance_name}")
-        if not math.isfinite(distance) or distance < 0:
-            raise ValueError(f"Invalid distance for image: {image.name}")
-        used.add(distance_name)
-        matched.append((distance, image.name, image.center))
-    if len(matched) < 2:
-        raise ValueError("At least two registered front cameras with distances are required")
-    matched.sort(key=lambda item: (item[0], item[1]))
-    centers = np.array([item[2] for item in matched])
-    readings = np.array([item[0] for item in matched])
-    model_path = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(centers, axis=0), axis=1))]
-    meter_path = readings - readings[0]
-    if model_path[-1] <= 1e-12 or meter_path[-1] <= 0:
-        raise ValueError("Camera trajectory and distance range must both be nonzero")
-    scale = float(np.dot(model_path, meter_path) / np.dot(model_path, model_path))
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("Estimated scale must be finite and > 0")
-    residuals = scale * model_path - meter_path
-    return scale, {
-        "scale_meters_per_model_unit": scale,
-        "matched_images": len(matched),
-        "unused_distance_records": len(distances) - len(used),
-        "first_image": matched[0][1], "last_image": matched[-1][1],
-        "first_distance_m": float(readings[0]), "last_distance_m": float(readings[-1]),
-        "model_path_length": float(model_path[-1]),
-        "distance_span_m": float(meter_path[-1]),
-        "fit_rmse_m": float(np.sqrt(np.mean(residuals ** 2))),
-        "fit_max_abs_error_m": float(np.max(np.abs(residuals))),
-        "method": "least_squares_cumulative_camera_path_chords",
-    }
 
 
 def build_world_transform(reference: ImagePose, scale: float) -> np.ndarray:
@@ -177,7 +124,8 @@ def validate_output_path(output: Path, input_model: Path, distance_file: Path):
         raise ValueError(f"Output model path is not a directory: {output}")
 
 
-def verify_alignment(original, transformed, reference, scale, distances):
+def verify_alignment(original, transformed, reference, scale, distances, *,
+                     fit_image_names=None, scale_fit_options=None):
     after = {image.name: image for image in transformed}
     if set(after) != {image.name for image in original}:
         raise RuntimeError("Transformed model has different registered front images")
@@ -197,11 +145,24 @@ def verify_alignment(original, transformed, reference, scale, distances):
         max_center_error = max(max_center_error, float(np.linalg.norm(actual.center - expected_center)))
     if not np.allclose(after[reference.name].camera_from_world, np.eye(4), atol=1e-6, rtol=0):
         raise RuntimeError("Reference front camera is not the identity pose")
-    verified_scale, _ = estimate_metric_scale(transformed, distances)
+    options = ScaleFitOptions() if scale_fit_options is None else scale_fit_options
+    if fit_image_names is None:
+        _, original_fit = estimate_metric_scale(original, distances, options=options)
+        fit_image_names = original_fit["fit_image_names"]
+    selected_names = set(fit_image_names)
+    if len(selected_names) < 2 or not selected_names.issubset(after):
+        raise RuntimeError("Invalid image set for metric scale verification")
+    # Keep the exact original fit anchors. Re-detecting/filtering after the
+    # transform could conceal a changed fit set or a previously contaminated fit.
+    fit_images = [image for image in transformed if image.name in selected_names]
+    verified_scale, output_fit = estimate_metric_scale(
+        fit_images, distances, options=replace(options, filter_position_outliers=False))
     if not np.isclose(verified_scale, 1.0, rtol=1e-6, atol=1e-8):
         raise RuntimeError("Transformed model failed metric scale verification")
     return {"reference_pose_identity": True, "output_meters_per_unit": verified_scale,
-            "max_camera_center_error_m": max_center_error}
+            "max_camera_center_error_m": max_center_error,
+            "scale_fit_images": len(fit_images), "scale_fit_quality_passed": True,
+            "distance_fit_rmse_m": output_fit["fit_rmse_m"]}
 
 
 def align_model(config: AlignmentConfig) -> AlignmentResult:
@@ -220,12 +181,22 @@ def align_model(config: AlignmentConfig) -> AlignmentResult:
     if colmap_path is None:
         raise RuntimeError("COLMAP is required for model transformation. Install it or specify "
                            f"--colmap-bin with its executable path: {config.colmap_bin}")
-    images, _ = read_front_poses(input_model, config.front_name_pattern, config.front_camera_id)
+    images, images_source = read_front_poses(input_model, config.front_name_pattern, config.front_camera_id)
     reference = find_reference(images, config.reference_image)
     distances = read_distances(distance_file)
-    scale, scale_report = estimate_metric_scale(images, distances)
+    scale, scale_report = estimate_metric_scale(images, distances, options=config.scale_fit_options)
+    if reference.name not in scale_report["fit_image_names"]:
+        raise ValueError(f"Reference image was excluded from the scale fit: {reference.name}; "
+                         "choose a reliable frame with --reference-image")
+    scale_report["input_images_sha256"] = hashlib.sha256(images_source.read_bytes()).hexdigest()
+    for record in scale_report["excluded_pose_outliers"]:
+        print(f"WARNING: Excluded from scale fitting: {record['image']} "
+              f"(position residual {record['position_error_m']:.6g} m)", file=sys.stderr)
     transform = build_world_transform(reference, scale)
     print(f"Reference: {reference.name}; metric scale: {scale:.12g} m/input unit")
+    print(f"Scale fit: {scale_report['fit_images']}/{scale_report['matched_images']} frames; "
+          f"RMSE {scale_report['fit_rmse_m']:.6g} m "
+          f"({scale_report['fit_relative_rmse']:.2%} of distance span)")
 
     output_model.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="colmap_align_", dir=output_model.parent) as temporary:
@@ -239,7 +210,9 @@ def align_model(config: AlignmentConfig) -> AlignmentResult:
             "input_model": str(input_model), "output_model": str(output_model),
             "distance_file": str(distance_file), "reference_image": reference.name,
             "length_unit": "m", "world_definition": "X_new = s * (R_ref @ X_old + t_ref)",
-            "verification": verify_alignment(images, transformed, reference, scale, distances),
+            "verification": verify_alignment(
+                images, transformed, reference, scale, distances,
+                fit_image_names=scale_report["fit_image_names"], scale_fit_options=config.scale_fit_options),
         })
         (staged / "scale_report.json").write_text(
             json.dumps(scale_report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
