@@ -8,6 +8,7 @@ outputs/
 tests/
 json/
 extrinsics/*.yaml
+scan/*.json
 colmap/sparse
 
 # 日志

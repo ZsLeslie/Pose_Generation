@@ -7,7 +7,8 @@
 推荐入口为项目根目录的 `main.py`，按以下顺序调用项目模块：
 
 1. 通过 `transformZ.align_model()`，根据距离文件恢复整个 sparse 模型的米制尺度，并以参考前相机的光学坐标系定义新世界坐标系。
-2. 从转换后的模型读取前相机位姿，调用 `generate_poses()` 计算左、中、右相机位姿，输出四相机的 JSON 和 CSV。
+2. 从米制模型读取前相机位姿，通过 `laser_ply.stitch_laser_scans()` 拼接 `scan/scan.json` 的雷达点云。
+3. 调用 `generate_poses()` 计算左、中、右相机位姿，输出四相机的 JSON 和 CSV。
 
 需要 Python 3.10+、`requirements.txt` 中的依赖，以及运行环境中的 COLMAP 命令行程序。导入项目模块不会执行 COLMAP；只有调用主流程或独立对齐程序时才检查该程序是否可用。
 
@@ -16,11 +17,13 @@ python -m pip install -r requirements.txt
 python main.py --input colmap/sparse --distance distance.xlsx --extrinsics extrinsics/rig_extrinsics.yaml --output outputs/pipeline
 ```
 
+默认读取 `scan/scan.json`；可以用 `--scan` 更换扫描文件，或传入 `--skip-laser` 仅执行原有的尺度恢复和三相机位姿流程。
+
 COLMAP 未加入 PATH 时，通过 `--colmap-bin "C:\path\to\colmap.exe"` 指定程序路径。可以通过 `--reference-image front_1785227493507.jpg` 指定参考帧；不指定时，选择按图像名自然排序的第一个已注册前相机。参考帧必须属于 `--front-name-pattern` 和 `--front-camera-id` 筛选后的前相机集合。
 
 参考帧相机中心变为 `(0, 0, 0)`，相机到世界、世界到相机变换均为单位矩阵；新世界轴为该帧光学 X 向右、Y 向下、Z 向前。这里的 Z 轴是参考相机光轴，不代表重力方向。世界坐标变换为 `X_new = s * (R_ref @ X_old + t_ref)`，同时作用于模型位姿和三维点。
 
-**尺度只恢复一次。** 第一步已经将模型变为米制，第二步固定使用 `meters_per_colmap_unit=1.0`，直接将以米为单位的机间外参与前相机位姿组合。原始尺度因子 `s` 单独保存在报告中，不会再次应用于三相机基线。
+**尺度只恢复一次。** 第一步已经将模型变为米制，雷达拼接直接使用该模型的位姿；三相机计算固定使用 `meters_per_colmap_unit=1.0`。原始尺度因子 `s` 单独保存在报告中，不会再次应用于雷达量程、雷达安装偏移或三相机基线。
 
 默认输出结构：
 
@@ -30,15 +33,19 @@ outputs/pipeline/
     transform_sim3.txt       # COLMAP 使用的八项 Sim3 参数
     T_new_from_old.txt        # 新旧世界坐标之间的 4x4 相似变换矩阵
     scale_report.json        # 尺度拟合及模型变换验证报告
+  laser/
+    laser.ply                # 拼接的雷达点云，与 sparse_metric 共用米制世界坐标系
+    laser_poses.json         # 实际使用的扫描记录、插值锚点及雷达双向位姿
+    laser_report.json        # 匹配、过滤、点数、外参与坐标范围报告
   poses/
     poses.json               # 四相机位姿，含参考坐标系、单位、标定与对齐元数据
     poses.csv                # 每帧 front/left/mid/right 各一行，length_unit=m
   pipeline_report.json       # 完整流程的输入、输出、参考帧、尺度和统计信息
 ```
 
-重复运行时，显式传入 `--overwrite` 才会替换已有主流程结果。输入 sparse 模型、距离文件和外参文件必须放在输出目录之外。完整模型在临时目录完成转换和验证后才发布到 `sparse_metric`。
+重复运行时，显式传入 `--overwrite` 才会替换已有主流程结果。输入 sparse 模型、距离文件、扫描文件和外参文件必须放在输出目录之外。完整模型在临时目录完成转换和验证后才发布到 `sparse_metric`。
 
-尺度拟合延用原程序的累计相机路径弦长最小二乘方法；输入位姿的离群点、采样稀疏和距离数据误差都会影响拟合。流程保留原始帧，不自动删除、插值或平滑位姿，可检查 `scale_report.json` 中的误差统计。
+尺度拟合延用原程序的累计相机路径弦长最小二乘方法；输入位姿的离群点、采样稀疏和距离数据误差都会影响拟合。原始 sparse 与四相机导出保留全部选中帧；雷达阶段会单独检测并排除插值锚点中的离群位姿，不回写 sparse 模型或相机 CSV。可检查 `scale_report.json` 的拟合误差和 `laser_report.json` 的排除记录。
 
 COLMAP 的相似变换文件采用 `scale qw qx qy qz tx ty tz` 八项格式，见 [COLMAP Sim3 文件实现](https://github.com/colmap/colmap/blob/main/src/colmap/geometry/sim3.cc)。
 
@@ -47,11 +54,13 @@ COLMAP 的相似变换文件采用 `scale qw qx qy qz tx ty tz` 八项格式，�
 ```text
 main.py                  # 参数解析与主程序入口
 src/
-  pipeline.py            # 配置、返回结果与两阶段流程编排
+  pipeline.py            # 配置、返回结果与三阶段流程编排
   transformZ.py          # 尺度估计、参考相机对齐、COLMAP 调用与结果验证
   distance_io.py         # TXT 距离读取及 Excel 到 TXT 的转换
   colmap_io.py           # COLMAP BIN/TXT 位姿读取、前相机筛选和排序
   geometry.py            # 四元数、旋转矩阵、相机中心及位姿求逆
+  laser_ply.py           # 雷达扫描读取、位姿匹配、SLERP 插值与点云拼接
+  pointcloud.py          # 体素/SOR/ROR 过滤及彩色 PLY 导出
   generate_poses.py      # 机间外参读取、位姿计算与 JSON/CSV 导出
   visualize_poses.py     # 轨迹图与统计导出
 ```
@@ -72,6 +81,46 @@ result = run_pipeline(PipelineConfig(
 ))
 print(result.poses_csv)
 ```
+
+## 雷达点云拼接
+
+项目内的 `src/laser_ply.py` 根据提供的同名脚本集成，保留里程插值、旋转 SLERP、MAD 位姿异常检测、强度灰度颜色和激光极坐标转换。读取模型使用项目已有的 BIN/TXT 解析器；不需要安装 `pycolmap` 或 `pandas`，新增依赖为 `scipy`。
+
+它直接加载 `sparse_metric` 中已恢复尺度的前相机位姿，不执行原脚本中的再次缩放、平面拟合校正、`M_AXIS` 轴转换或坐标原点平移。雷达点云、米制 sparse 点云和相机位姿因此共用同一世界坐标系。
+
+扫描文件采用 JSON Lines：每行一个包含 `timestamp`、`distance`、`angle_min`、`angle_increment`、`ranges` 等字段的扫描记录；`intensities` 可选。距离与量程单位均为米，角度单位为弧度。空值、非有限量程及超出配置范围或雷达自身量程限制的点会被过滤。
+
+图像与距离记录按 `name` 匹配，支持唯一的文件名匹配，不以 Excel 行号或 COLMAP 图像 ID 作为对应关系。Excel 有 `time` / `timestamp` 列时读取其时间；否则从 `front_1785227493507.jpg` 这类文件名中提取采集时间。支持秒、毫秒、微秒和纳秒 Unix 时间戳；相机与扫描时间必须使用同一时钟基准。
+
+默认使用相邻前相机时间窗口前后各 20 秒的扫描记录，在两帧累计里程范围内，按 0.01 米网格选择最近的扫描。相机中心按选中扫描的实际里程线性插值，旋转使用 SLERP。重复里程保留最后一次记录，同一条扫描最多拼接一次，不将相同测量重复复制到多个网格位置；不对相机里程范围外的扫描做外推。`--laser-distance-step 0` 可处理每个窗口内所有唯一里程的扫描。
+
+位姿异常检测沿用原脚本的 0.15 米位置残差下限、2° 旋转残差下限、6 倍 MAD 系数及最多 5 轮局部峰值剔除。仅从雷达插值中排除这些帧，报告会保存图像名和残差。`--keep-laser-pose-outliers` 可关闭该检测。该步骤不能消除已受离群位姿影响的尺度拟合误差。
+
+雷达局部坐标沿用原脚本：`[r*sin(angle), 0, -r*cos(angle)]`。默认安装外参也沿用原脚本：雷达在前相机坐标中的偏移为 `[-36, 32.258, -442.5] mm`，局部点先绕 X 轴旋转 90° 再加偏移。需要对应当前 rig 时，可提供 OpenCV YAML：
+
+```yaml
+%YAML:1.0
+---
+translation_unit: m
+H_front_from_laser: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 1., 0., 0., -0.036,
+           0., 0., -1., 0.032258,
+           0., 1., 0., -0.4425,
+           0., 0., 0., 1. ]
+```
+
+通过 `--laser-extrinsics extrinsics/laser_extrinsics.yaml` 指定。矩阵定义为 `X_front = H_front_from_laser @ X_laser`，平移单位为米，前相机坐标必须与本次 `--front-frame work/capture` 使用的光学坐标一致。外参来源和矩阵会写入拼接报告。
+
+已有米制模型时可以独立执行雷达阶段，不调用 COLMAP：
+
+```powershell
+python src/laser_ply.py --model outputs/pipeline/sparse_metric --distance distance.xlsx --scan scan/scan.json --output outputs/pipeline/laser
+```
+
+独立接口为 `stitch_laser_scans(LaserConfig(...))`，调用者应传入已经米制对齐的模型。体素、SOR、ROR 过滤与原脚本的实际执行逻辑一致，默认关闭；可通过 `LaserConfig` 的 `voxel_size_m`、`sor_neighbors`、`ror_radius_m` 等参数开启。输出是强度灰度 RGB 的 ASCII PLY，不包含彩色图像投影，也不对单次扫描内各激光束的采样时间做运动补偿。
 
 ## 独立运行位姿生成
 
