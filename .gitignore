@@ -7,9 +7,10 @@ venv/
 outputs/
 tests/
 json/
-extrinsics/*.yaml
-scan/*.json
-colmap/sparse
+extrinsics/
+distance/
+scan/
+colmap/
 
 # 日志
 *.log
